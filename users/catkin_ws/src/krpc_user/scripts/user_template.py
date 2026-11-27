@@ -10,11 +10,11 @@ from krpc_ib2_msgs.srv import MissionStart, MissionFinished, CheckPoints
 from krpc_ib2_msgs.msg import CheckpointPassedAction, CheckpointPassedGoal
 from ib2_msgs.msg import CtlCommandAction, CtlCommandGoal, CtlCommandResult, CtlStatusType
 
-# Optional IF examples. Uncomment only what your program uses.
-# from std_msgs.msg import Time
-# from platform_msgs.msg import UserNodeStatus
-# from sensor_msgs.msg import Image
-# from ib2_msgs.msg import Navigation
+# ---- Tunable settings ----
+START_DELAY = 0.0      # browser e live dekhte chaile 15.0 dao, dekha shesh hole 0.0 koro
+TIME_LIMIT = 270.0     # 300s er age safe margin, er por baki checkpoint skip kore goal e jabe
+SETTLE_TIME = 1.5      # checkpoint e pouchhe stable hobar jonno wait (second)
+DOCK_POSITION = [0.2, 0.0, 0.0]
 
 
 class UserTemplate:
@@ -33,12 +33,6 @@ class UserTemplate:
 
         # Subscriber
         self.__subscriber_start = rospy.Subscriber('/ib2_user/start', UserLogic, self.__callback_start)  # DO NOT REMOVE THIS LINE
-
-        # Optional subscriber examples.
-        # /sensor_fusion/navigation provides the current Int-Ball2 pose, velocity and acceleration.
-        # self.__subscriber_nav = rospy.Subscriber('/sensor_fusion/navigation', Navigation, self.__callback_nav)
-        # /camera_main/image_raw provides the main camera image.
-        # self.__subscriber_camera = rospy.Subscriber('/camera_main/image_raw', Image, self.__callback_camera_image)
 
         # Service server
         self.__stop_processing_server = rospy.Service('/ib2_user/stop', StopProcessingUserNode, self.__stop_processing) # DO NOT REMOVE THIS LINE
@@ -81,49 +75,34 @@ class UserTemplate:
                 return int(checkpoint[key])
         return None
 
-    def __resolve_first_checkpoint_target(self):
-        default_target = {
-            'checkpoint_id': 1,
-            'position': [0.0, 0.0, 0.0],
-            'quaternion': [0.0, 0.0, 0.0, 1.0],
-        }
+    def __resolve_all_checkpoints(self):
+        """Return (list of targets, goalpoint_id)."""
         rospy.wait_for_service('/mission/get_checkpoints')
         res = self.__checkpoints()
-        rospy.loginfo('get_checkpoints result: success=%s message=%s', res.success, res.message)
+        rospy.loginfo('get_checkpoints result: success=%s', res.success)
         if not res.success:
-            return default_target
-
+            return [], None
         try:
             payload = json.loads(res.message)
-            checkpoints = payload.get('checkpoints', payload.get('Checkpoints', []))
-            checkpoints = [cp for cp in checkpoints if isinstance(cp, dict) and self.__get_checkpoint_id(cp) is not None]
-            if not checkpoints:
-                rospy.logwarn('No checkpoints found in payload')
-                return default_target
-
-            checkpoint = min(checkpoints, key=self.__get_checkpoint_id)
-            position = checkpoint.get('position', default_target['position'])
-
-            if not (isinstance(position, list) and len(position) >= 3):
-                rospy.logwarn('Invalid checkpoint position format')
-                return default_target
-
-            quaternion = default_target['quaternion']
-            attitude = checkpoint.get('attitude')
-            if isinstance(attitude, dict):
-                attitude_quaternion = attitude.get('quaternion')
-                if isinstance(attitude_quaternion, list) and len(attitude_quaternion) >= 4:
-                    quaternion = attitude_quaternion
-
-            return {
-                'checkpoint_id': self.__get_checkpoint_id(checkpoint),
-                'position': [float(position[0]), float(position[1]), float(position[2])],
-                'quaternion': [float(quaternion[0]), float(quaternion[1]), float(quaternion[2]), float(quaternion[3])],
-            }
+            goal_id = payload.get('goalpoint_id')
+            targets = []
+            for cp in payload.get('checkpoints', []):
+                if not isinstance(cp, dict):
+                    continue
+                cid = self.__get_checkpoint_id(cp)
+                pos = cp.get('position')
+                quat = (cp.get('attitude') or {}).get('quaternion')
+                if cid is None or not pos or not quat:
+                    continue
+                targets.append({
+                    'checkpoint_id': cid,
+                    'position': [float(v) for v in pos[:3]],
+                    'quaternion': [float(v) for v in quat[:4]],
+                })
+            return targets, goal_id
         except Exception as e:
             rospy.logwarn('Failed to parse checkpoints payload: %s', e)
-
-        return default_target
+            return [], None
 
     def __move_to_checkpoint(self, checkpoint_target):
         position = checkpoint_target['position']
@@ -163,16 +142,59 @@ class UserTemplate:
 
     def __run_user_flow(self, msg):
         try:
+            if START_DELAY > 0:
+                rospy.sleep(START_DELAY)
+
+            t_start = rospy.get_time()
             if not self.__notify_mission_start():
                 return
 
-            # USER EDIT AREA: define route planning and game-specific flow here.
+            # USER EDIT AREA: route planning and game flow
             # ***********************************************
-            checkpoint_target = self.__resolve_first_checkpoint_target()
-            if not self.__move_to_checkpoint(checkpoint_target):
+            targets, goal_id = self.__resolve_all_checkpoints()
+            if not targets:
+                rospy.logerr('no checkpoints')
                 return
-            if not self.__notify_checkpoint_passed(checkpoint_target['checkpoint_id']):
-                return
+
+            goal_target = None
+            remaining = []
+            for t in targets:
+                if t['checkpoint_id'] == goal_id:
+                    goal_target = t
+                else:
+                    remaining.append(t)
+
+            current = list(DOCK_POSITION)
+
+            # visit remaining checkpoints, nearest first
+            while remaining and not rospy.is_shutdown():
+                if rospy.get_time() - t_start > TIME_LIMIT:
+                    rospy.logwarn('time is running out, skipping remaining checkpoints')
+                    break
+
+                nxt = min(
+                    remaining,
+                    key=lambda t: sum((a - b) ** 2 for a, b in zip(t['position'], current))
+                )
+                remaining.remove(nxt)
+
+                if not self.__move_to_checkpoint(nxt):
+                    rospy.logwarn('move failed for checkpoint %d', nxt['checkpoint_id'])
+                    continue
+
+                current = nxt['position']
+                rospy.sleep(SETTLE_TIME)
+
+                if not self.__notify_checkpoint_passed(nxt['checkpoint_id']):
+                    rospy.logwarn('retry checkpoint %d', nxt['checkpoint_id'])
+                    rospy.sleep(1.0)
+                    self.__notify_checkpoint_passed(nxt['checkpoint_id'])
+
+            # finally go to the goal point
+            if goal_target is not None and not rospy.is_shutdown():
+                if self.__move_to_checkpoint(goal_target):
+                    rospy.sleep(SETTLE_TIME)
+                    self.__notify_checkpoint_passed(goal_target['checkpoint_id'])
             # ***********************************************
 
             if not rospy.is_shutdown():
@@ -188,18 +210,6 @@ class UserTemplate:
 
         rospy.loginfo('start %s', msg)
         self.__run_user_flow(msg)
-
-    # Optional subscriber callback examples.
-    # def __callback_nav(self, data):
-    #     position = data.pose.pose.position
-    #     orientation = data.pose.pose.orientation
-    #     rospy.loginfo('current pose: x=%.3f y=%.3f z=%.3f qx=%.4f qy=%.4f qz=%.4f qw=%.4f',
-    #                   position.x, position.y, position.z,
-    #                   orientation.x, orientation.y, orientation.z, orientation.w)
-    #
-    # def __callback_camera_image(self, data):
-    #     rospy.loginfo('camera image: width=%d height=%d encoding=%s',
-    #                   data.width, data.height, data.encoding)
 
     def __stop_processing(self, request):
         try:
